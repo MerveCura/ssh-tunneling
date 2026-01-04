@@ -1,0 +1,18 @@
+# build çıktıları
+build/
+cmake-build-*/
+*.o
+*.obj
+*.out
+*.exe
+a.out
+
+# geçici dosyalar
+*.log
+*.bin
+received_*.bin
+
+# IDE
+.vscode/
+.idea/
+.DS_Store
