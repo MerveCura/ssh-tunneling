@@ -8,16 +8,19 @@
 #include <string>
 #include <vector>
 #include <iostream>
+#include <cstdlib>
+#include <cmath>
+#include <algorithm>
 
 static constexpr uint32_t MAGIC   = 0x53534854; // 'SSHT'
 static constexpr uint16_t VERSION = 1;
 
-static constexpr size_t MAX_PAYLOAD = 1024 * 1024; // güvenlik limiti (1MB)
+static constexpr size_t MAX_PAYLOAD = 1024 * 1024; // 1MB
 
 enum class FrameType : uint16_t {
-  HELLO     = 1,   // handshake start (unencrypted)
-  HELLO_ACK = 2,   // handshake reply (unencrypted)
-  DATA      = 3,   // encrypted payload
+  HELLO     = 1,
+  HELLO_ACK = 2,
+  DATA      = 3,
   ACK       = 4,
   FIN       = 5
 };
@@ -37,7 +40,7 @@ struct FrameHeader {
   uint16_t reserved;
   uint32_t seq;
   uint32_t payload_len;
-  uint32_t checksum;     // plaintext checksum (decrypt sonrası doğrulanır)
+  uint32_t checksum;
 };
 #pragma pack(pop)
 
@@ -45,7 +48,6 @@ inline void log_line(const std::string& tag, const std::string& msg){
   std::cerr << "[" << tag << "] " << msg << "\n";
 }
 
-// Basit checksum: eğitimsel ve deterministik
 inline uint32_t checksum_simple(const uint8_t* data, size_t n){
   uint32_t s = 0;
   for (size_t i = 0; i < n; i++) s = (s * 131u) + data[i];
@@ -95,13 +97,12 @@ inline bool recv_all(int fd, uint8_t* buf, size_t n){
       if (errno == EINTR) continue;
       return false;
     }
-    if (r == 0) return false; // peer closed
+    if (r == 0) return false;
     off += (size_t)r;
   }
   return true;
 }
 
-// XOR “simetrik şifreleme” (SSH’in karmaşıklığı yok; rapordaki öğretici model)
 inline void xor_crypt_inplace(std::vector<uint8_t>& data, const std::vector<uint8_t>& key){
   if (key.empty()) return;
   for (size_t i = 0; i < data.size(); i++){
@@ -109,9 +110,7 @@ inline void xor_crypt_inplace(std::vector<uint8_t>& data, const std::vector<uint
   }
 }
 
-// Handshake: nonce + pre_shared_key -> session_key türet (kavramsal)
 inline std::vector<uint8_t> derive_session_key(uint32_t client_nonce, uint32_t server_nonce, const std::string& psk){
-  // Öğretici bir türetme: nonce’lar + psk üstünden bir dizi byte üretelim
   uint8_t mix[12];
   std::memcpy(mix + 0, &client_nonce, 4);
   std::memcpy(mix + 4, &server_nonce, 4);
@@ -121,13 +120,12 @@ inline std::vector<uint8_t> derive_session_key(uint32_t client_nonce, uint32_t s
   uint32_t seed = checksum_simple(mix, sizeof(mix));
   std::vector<uint8_t> key(32);
   for (size_t i = 0; i < key.size(); i++){
-    seed = seed * 1664525u + 1013904223u; // LCG
+    seed = seed * 1664525u + 1013904223u;
     key[i] = (uint8_t)((seed >> 24) & 0xFF);
   }
   return key;
 }
 
-// FRAME gönder/al: payload şifreli mi değil mi kontrolünü çağıran taraf yapacak
 inline bool send_frame_raw(int fd, FrameType type, ContentType ctype, uint32_t seq,
                            const std::vector<uint8_t>& payload, uint32_t plaintext_checksum){
   if (payload.size() > MAX_PAYLOAD) return false;
@@ -167,4 +165,80 @@ inline bool recv_frame_raw(int fd, FrameHeader& out_h, std::vector<uint8_t>& out
 
   out_h = h;
   return true;
+}
+
+inline std::string hex_preview(const std::vector<uint8_t>& v, size_t max_bytes = 32){
+  static const char* hexd = "0123456789abcdef";
+  std::string s;
+  size_t n = std::min(v.size(), max_bytes);
+  s.reserve(n * 3);
+  for (size_t i = 0; i < n; i++){
+    uint8_t b = v[i];
+    s.push_back(hexd[(b >> 4) & 0xF]);
+    s.push_back(hexd[b & 0xF]);
+    if (i + 1 < n) s.push_back(' ');
+  }
+  if (v.size() > n) s += " ...";
+  return s;
+}
+
+// ---------------- NOISE / SNR SIM ----------------
+inline uint32_t lcg_next(uint32_t& st){
+  st = st * 1664525u + 1013904223u;
+  return st;
+}
+
+inline bool noise_enabled(){
+  const char* e = std::getenv("NOISE_SNR_DB");
+  return (e && std::strlen(e) > 0);
+}
+
+inline double snr_db(){
+  const char* e = std::getenv("NOISE_SNR_DB");
+  if (!e) return 0.0;
+  return std::atof(e);
+}
+
+inline uint32_t noise_seed(){
+  const char* e = std::getenv("NOISE_SEED");
+  if (!e) return 12345u;
+  return (uint32_t)std::strtoul(e, nullptr, 10);
+}
+
+/*
+  Daha "kademeli" mapping:
+  - 30 dB => ~1e-7
+  - 20 dB => ~1e-6
+  - 10 dB => ~1e-5
+  - 0  dB => ~1e-4
+  Bu sayede 10 dB'de %100 yerine daha makul FER görürsün.
+*/
+inline double snr_to_bitflip_prob(double db){
+  double p = std::pow(10.0, -((db + 40.0) / 10.0));
+  return std::clamp(p, 0.0, 0.01);
+}
+
+inline void apply_noise_inplace(std::vector<uint8_t>& data, uint32_t frame_seq){
+  if (!noise_enabled()) return;
+  if (data.empty()) return;
+
+  double db = snr_db();
+  double p_bit = snr_to_bitflip_prob(db);
+
+  uint32_t st = noise_seed() ^ (frame_seq * 2654435761u);
+
+  // byte seviyesine çevirelim ama daha yumuşak:
+  // p_byte ≈ 1 - (1 - p_bit)^8 ≈ 8*p_bit (küçük p için)
+  double p_byte = std::clamp(8.0 * p_bit, 0.0, 0.02);
+
+  for (size_t i = 0; i < data.size(); i++){
+    uint32_t r = lcg_next(st);
+    double u = (double)(r & 0xFFFFFF) / (double)0x1000000;
+    if (u < p_byte){
+      // Tek bit flip yeterli (çok agresif olmasın)
+      uint32_t r2 = lcg_next(st);
+      uint8_t mask = (uint8_t)(1u << (r2 % 8));
+      data[i] ^= mask;
+    }
+  }
 }

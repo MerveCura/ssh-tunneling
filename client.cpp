@@ -3,6 +3,9 @@
 #include <sys/socket.h>
 #include <fstream>
 #include <sstream>
+#include <ctime>
+#include <cstdlib>
+#include <algorithm>
 
 static constexpr const char* SERVER_IP = "127.0.0.1";
 static constexpr int PORT = 5050;
@@ -29,6 +32,23 @@ static std::vector<uint8_t> parse_hex(const std::string& hex){
   return out;
 }
 
+static bool has_env(const char* k){
+  const char* v = std::getenv(k);
+  return (v && std::strlen(v) > 0);
+}
+
+static double get_env_double(const char* k, double defv){
+  const char* v = std::getenv(k);
+  if (!v) return defv;
+  return std::atof(v);
+}
+
+static uint32_t get_env_u32(const char* k, uint32_t defv){
+  const char* v = std::getenv(k);
+  if (!v) return defv;
+  return (uint32_t)std::strtoul(v, nullptr, 10);
+}
+
 int main(int argc, char** argv){
   int cfd = ::socket(AF_INET, SOCK_STREAM, 0);
   if (cfd < 0){ perror("socket"); return 1; }
@@ -46,10 +66,28 @@ int main(int argc, char** argv){
   }
   log_line("CLIENT", "connected to " + std::string(SERVER_IP) + ":" + std::to_string(PORT));
 
-  // 1) Handshake HELLO(client_nonce)
+  // 1) Handshake HELLO(client_nonce [+ snr_x100 + seed])
   uint32_t client_nonce = (uint32_t)time(nullptr) ^ (uint32_t)getpid();
-  std::vector<uint8_t> helloPayload(4);
-  std::memcpy(helloPayload.data(), &client_nonce, 4);
+
+  std::vector<uint8_t> helloPayload;
+
+  bool noise_on = has_env("NOISE_SNR_DB");
+  if (noise_on){
+    double snr = get_env_double("NOISE_SNR_DB", 0.0);
+    uint32_t seed = get_env_u32("NOISE_SEED", 12345u);
+
+    int32_t snr_x100 = (int32_t)std::lround(snr * 100.0);
+
+    helloPayload.resize(12);
+    std::memcpy(helloPayload.data() + 0, &client_nonce, 4);
+    std::memcpy(helloPayload.data() + 4, &snr_x100, 4);
+    std::memcpy(helloPayload.data() + 8, &seed, 4);
+
+    log_line("CLIENT", "noise enabled: SNR(dB)=" + std::to_string(snr) + " seed=" + std::to_string(seed));
+  } else {
+    helloPayload.resize(4);
+    std::memcpy(helloPayload.data(), &client_nonce, 4);
+  }
 
   uint32_t helloCs = checksum_simple(helloPayload.data(), helloPayload.size());
   if (!send_frame_raw(cfd, FrameType::HELLO, ContentType::BIN, 1, helloPayload, helloCs)){
@@ -75,8 +113,7 @@ int main(int argc, char** argv){
 
   uint32_t seq = 10;
 
-  // -------- FILE MODE --------
-  // Kullanım: ./client file test.pgm
+  // FILE MODE: ./client file <path>
   if (argc >= 3 && std::string(argv[1]) == "file"){
     std::string path = argv[2];
     std::ifstream f(path, std::ios::binary);
@@ -99,6 +136,9 @@ int main(int argc, char** argv){
       std::vector<uint8_t> enc = plain;
       xor_crypt_inplace(enc, session_key);
 
+      // noise, encryption'dan SONRA uygulanır (kanal bozuyor gibi)
+      apply_noise_inplace(enc, seq);
+
       if (!send_frame_raw(cfd, FrameType::DATA, ContentType::BIN, seq++, enc, cs)){
         log_line("CLIENT", "send DATA failed");
         break;
@@ -113,7 +153,7 @@ int main(int argc, char** argv){
     return 0;
   }
 
-  // -------- INTERACTIVE MODE (text/json/binhex) --------
+  // INTERACTIVE MODE
   log_line("CLIENT", "Type lines. Prefixes: text: / json: / binhex: . Ctrl+D to exit.");
   log_line("CLIENT", "Examples: text:hello | json:{\"a\":1} | binhex:48656c6c6f");
 
@@ -148,12 +188,12 @@ int main(int argc, char** argv){
     std::vector<uint8_t> enc = plain;
     xor_crypt_inplace(enc, session_key);
 
+    apply_noise_inplace(enc, seq);
+
     if (!send_frame_raw(cfd, FrameType::DATA, ctype, seq++, enc, cs)){
       log_line("CLIENT", "send DATA failed");
       break;
     }
-
-    log_line("CLIENT", "SENT DATA seq=" + std::to_string(seq-1) + " len=" + std::to_string(enc.size()));
   }
 
   send_frame_raw(cfd, FrameType::FIN, ContentType::BIN, seq++, {}, 0);
